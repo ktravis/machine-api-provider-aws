@@ -19,10 +19,17 @@ package controllers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/aws/aws-sdk-go/service/iam"
 	"github.com/criticalstack/machine-api/util"
 	"github.com/go-logr/logr"
 	"github.com/go-openapi/spec"
+	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -35,6 +42,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	"github.com/criticalstack/machine-api-provider-aws/api/v1alpha1"
+)
+
+const (
+	lastUpdatedAnnotation = "infrastructure.crit.sh/lastUpdated"
+	secretAgeThreshold    = 5 * time.Minute
 )
 
 // AWSInfrastructureProviderReconciler reconciles a AWSInfrastructureProvider object
@@ -74,7 +86,7 @@ func (r *AWSInfrastructureProviderReconciler) Reconcile(req ctrl.Request) (_ ctr
 
 	ipOwner, err := util.GetOwnerInfrastructureProvider(ctx, r.Client, ip.ObjectMeta)
 	if err != nil {
-		return ctrl.Result{}, err
+		return ctrl.Result{}, errors.Wrap(err, "failed to retrieve owner infraprovider")
 	}
 	if ipOwner == nil {
 		log.Info("InfrastructureProvider Controller has not yet set OwnerRef")
@@ -94,12 +106,18 @@ func (r *AWSInfrastructureProviderReconciler) Reconcile(req ctrl.Request) (_ ctr
 	}
 
 	ip.Status.Ready = !s.GetCreationTimestamp().Time.IsZero() // ready if secret already exists
-	ip.Status.LastUpdated = metav1.Now()
-	defer func() {
-		if err := r.Status().Update(ctx, ip); err != nil {
-			log.Error(err, "failed to update provider status")
+	if err := r.Status().Update(ctx, ip); err != nil {
+		log.Error(err, "failed to update provider status")
+		return ctrl.Result{}, err
+	}
+
+	if a := s.GetAnnotations(); a != nil {
+		if t, _ := time.Parse(time.RFC3339, a[lastUpdatedAnnotation]); time.Since(t) < secretAgeThreshold {
+			d := time.Until(t.Add(secretAgeThreshold))
+			log.Info("update not needed", "delay", d)
+			return ctrl.Result{RequeueAfter: d}, nil
 		}
-	}()
+	}
 
 	schema, err := r.schema(ctx, ip)
 	if err != nil {
@@ -112,44 +130,215 @@ func (r *AWSInfrastructureProviderReconciler) Reconcile(req ctrl.Request) (_ ctr
 
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, s, func() error {
 		s.Data = map[string][]byte{"schema": b}
+		a := s.GetAnnotations()
+		if a == nil {
+			a = make(map[string]string)
+		}
+		a[lastUpdatedAnnotation] = time.Now().Format(time.RFC3339)
+		s.SetAnnotations(a)
 		return controllerutil.SetControllerReference(ip, s, r.Scheme)
 	}); err != nil {
 		return ctrl.Result{}, err
 	}
-
-	ip.Status.Ready = true
 	return ctrl.Result{}, nil
 }
 
 const OpenAPISchemaSecretName = "config-schema"
 
+func getName(tags []*ec2.Tag) string {
+	var name string
+	for _, t := range tags {
+		if aws.StringValue(t.Key) == "Name" {
+			name = aws.StringValue(t.Value)
+			break
+		}
+	}
+	if name == "" {
+		name = "<no name>"
+	}
+	return name
+}
+
 func (r *AWSInfrastructureProviderReconciler) schema(ctx context.Context, ip *v1alpha1.AWSInfrastructureProvider) (*spec.Schema, error) {
+	awscfg := &aws.Config{Region: aws.String(ip.Spec.Region)}
+	svc := ec2.New(session.New(awscfg))
+	iamSvc := iam.New(session.New(awscfg))
+
+	describeInstanceTypesInput := &ec2.DescribeInstanceTypeOfferingsInput{
+		Filters: []*ec2.Filter{
+			{
+				Name:   aws.String("location"),
+				Values: aws.StringSlice([]string{ip.Spec.Region}),
+			},
+		},
+		MaxResults: aws.Int64(1000),
+	}
+	if ip.Spec.InstanceTypeFilter != "" {
+		describeInstanceTypesInput.Filters = append(describeInstanceTypesInput.Filters, &ec2.Filter{
+			Name:   aws.String("instance-type"),
+			Values: aws.StringSlice([]string{ip.Spec.InstanceTypeFilter}),
+		})
+	}
+	resp, err := svc.DescribeInstanceTypeOfferingsWithContext(ctx, describeInstanceTypesInput)
+	if err != nil {
+		return nil, err
+	}
+	instanceTypes := make([]interface{}, 0)
+	for _, x := range resp.InstanceTypeOfferings {
+		instanceTypes = append(instanceTypes, aws.StringValue(x.InstanceType))
+	}
+
+	describeImagesInput := &ec2.DescribeImagesInput{
+		Filters: []*ec2.Filter{
+			{
+				// TODO(ktravis): just make this a default imageFilter
+				Name:   aws.String("architecture"),
+				Values: aws.StringSlice([]string{"x86_64"}),
+			},
+		},
+		Owners: aws.StringSlice([]string{"self"}),
+	}
+	for _, f := range ip.Spec.ImageFilters {
+		describeImagesInput.Filters = append(describeImagesInput.Filters, &ec2.Filter{
+			Name:   aws.String(f.Name),
+			Values: aws.StringSlice(f.Values),
+		})
+	}
+	imgResp, err := svc.DescribeImagesWithContext(ctx, describeImagesInput)
+	if err != nil {
+		return nil, err
+	}
+	images := make([]interface{}, 0)
+	for _, x := range imgResp.Images {
+		images = append(images, aws.StringValue(x.Name))
+	}
+
+	describeSecurityGroupsInput := &ec2.DescribeSecurityGroupsInput{}
+	for _, f := range ip.Spec.SecurityGroupFilters {
+		describeSecurityGroupsInput.Filters = append(describeSecurityGroupsInput.Filters, &ec2.Filter{
+			Name:   aws.String(f.Name),
+			Values: aws.StringSlice(f.Values),
+		})
+	}
+	sgResp, err := svc.DescribeSecurityGroupsWithContext(ctx, describeSecurityGroupsInput)
+	if err != nil {
+		return nil, err
+	}
+	// TODO(ktravis): do the same as below with subnets, add security group rules as description
+	securityGroups := make([]interface{}, 0)
+	for _, x := range sgResp.SecurityGroups {
+		securityGroups = append(securityGroups, aws.StringValue(x.GroupName))
+	}
+
+	describeSubnetsInput := &ec2.DescribeSubnetsInput{
+		MaxResults: aws.Int64(100),
+	}
+	for _, f := range ip.Spec.SubnetFilters {
+		describeSubnetsInput.Filters = append(describeSubnetsInput.Filters, &ec2.Filter{
+			Name:   aws.String(f.Name),
+			Values: aws.StringSlice(f.Values),
+		})
+	}
+	subResp, err := svc.DescribeSubnetsWithContext(ctx, describeSubnetsInput)
+	if err != nil {
+		return nil, err
+	}
+	subnetOptions := make([]spec.Schema, 0)
+	for _, x := range subResp.Subnets {
+		subnetOptions = append(subnetOptions, *spec.StringProperty().
+			WithTitle(fmt.Sprintf("%s (%s)", getName(x.Tags), aws.StringValue(x.SubnetId))).
+			WithEnum(aws.StringValue(x.SubnetId)),
+		)
+	}
+
+	listInstanceProfilesInput := &iam.ListInstanceProfilesInput{
+		MaxItems: aws.Int64(1000),
+	}
+	ipResp, err := iamSvc.ListInstanceProfilesWithContext(ctx, listInstanceProfilesInput)
+	if err != nil {
+		return nil, err
+	}
+	instanceProfiles := make([]interface{}, 0)
+	for _, x := range ipResp.InstanceProfiles {
+		instanceProfiles = append(instanceProfiles, aws.StringValue(x.InstanceProfileName))
+	}
+
 	required := []spec.SchemaProps{
 		{
-			ID:    "instanceType",
-			Title: "Instance Type",
-			Type:  spec.StringOrArray{"string"},
-			Enum: []interface{}{
-				// put instance types here
-				"test",
-				"thing",
-			},
+			ID:          "instanceType",
+			Title:       "Instance Type",
+			Type:        spec.StringOrArray{"string"},
+			Enum:        instanceTypes,
 			Description: "type of instance",
 			Default:     "",
 		},
+
 		{
 			ID:          "machineImage",
 			Title:       "Machine Image",
 			Type:        spec.StringOrArray{"string"},
 			Description: "AMI to use",
-			Enum: []interface{}{
-				// put images here
-				"ubuntu",
-				"debbie",
-				"linus",
-			},
-			Default: "",
+			Enum:        images,
+			Default:     "",
 		},
+
+		{
+			ID:          "blockDevices",
+			Title:       "Block Devices",
+			Type:        spec.StringOrArray{"array"},
+			Description: "Block Devices",
+			Default: []interface{}{
+				map[string]interface{}{
+					"deviceName": "/dev/sda1",
+					"volumeSize": 100,
+					"volumeType": "ebs",
+					"encrypted":  true,
+				},
+			},
+			Items: &spec.SchemaOrArray{
+				Schema: &spec.Schema{
+					SchemaProps: spec.SchemaProps{
+						Type: spec.StringOrArray{"object"},
+						Properties: map[string]spec.Schema{
+							"deviceName": *spec.StringProperty(),
+							"volumeSize": *spec.Int64Property(),
+							"volumeType": *spec.StringProperty().WithDefault("ebs"),
+							"encrypted":  *spec.BoolProperty().WithDefault(true),
+						},
+						Required: []string{"deviceName", "volumeSize", "volumeType"},
+					},
+				},
+			},
+		},
+
+		spec.StringProperty().
+			WithID("region").
+			WithTitle("Region").
+			WithDefault(ip.Spec.Region).SchemaProps,
+
+		spec.ArrayProperty(
+			&spec.Schema{
+				SchemaProps: spec.SchemaProps{
+					Type:  spec.StringOrArray{"string"},
+					AnyOf: subnetOptions,
+				},
+			},
+		).
+			WithID("subnetIDs").
+			WithTitle("Subnets").SchemaProps,
+
+		spec.StringProperty().
+			WithID("iamInstanceProfile").
+			WithTitle("IAM Instance Profile").
+			WithEnum(instanceProfiles...).SchemaProps,
+
+		spec.ArrayProperty(
+			spec.StringProperty().
+				WithEnum(securityGroups...),
+		).
+			WithID("securityGroupNames").
+			WithTitle("SecurityGroups").SchemaProps,
+		// TODO(ktravis): more detail in the options, optional things - tags
 		// etc ...
 	}
 

@@ -22,8 +22,17 @@ import (
 
 // AWSInfrastructureProviderSpec defines the desired state of AWSInfrastructureProvider
 type AWSInfrastructureProviderSpec struct {
-	Region string `json:"region"`
+	Region               string   `json:"region"`
+	InstanceTypeFilter   string   `json:"instanceTypeFilter,omitempty"`
+	ImageFilters         []Filter `json:"imageFilters,omitempty"`
+	SecurityGroupFilters []Filter `json:"securityGroupFilters,omitempty"`
+	SubnetFilters        []Filter `json:"subnetFilters,omitempty"`
 	// other stuff
+}
+
+type Filter struct {
+	Name   string   `json:"name"`
+	Values []string `json:"values"`
 }
 
 // InfrastructureProviderStatus defines the observed state of AWSInfrastructureProvider

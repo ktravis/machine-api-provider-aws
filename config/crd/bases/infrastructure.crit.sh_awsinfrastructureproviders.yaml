@@ -48,6 +48,8 @@ spec:
           description: AWSInfrastructureProviderSpec defines the desired state of
             AWSInfrastructureProvider
           properties:
+            instanceTypeFilter:
+              type: string
             region:
               type: string
           required:
