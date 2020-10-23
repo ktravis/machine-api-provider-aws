@@ -5,7 +5,7 @@ go 1.14
 require (
 	github.com/aws/aws-sdk-go v1.33.21
 	github.com/criticalstack/crit v1.0.3
-	github.com/criticalstack/machine-api v1.0.1
+	github.com/criticalstack/machine-api v1.0.3-0.20201022221228-c08a2ed4eebf
 	github.com/go-logr/logr v0.1.0
 	github.com/go-openapi/spec v0.19.3
 	github.com/labstack/gommon v0.3.0
