@@ -225,9 +225,12 @@ func (r *AWSInfrastructureProviderReconciler) schema(ctx context.Context, ip *v1
 		return nil, err
 	}
 	// TODO(ktravis): do the same as below with subnets, add security group rules as description
-	securityGroups := make([]interface{}, 0)
+	securityGroups := make([]spec.Schema, 0)
 	for _, x := range sgResp.SecurityGroups {
-		securityGroups = append(securityGroups, aws.StringValue(x.GroupName))
+		securityGroups = append(securityGroups, *spec.StringProperty().
+			WithTitle(fmt.Sprintf("%s (%s)", aws.StringValue(x.GroupName), aws.StringValue(x.GroupId))).
+			WithEnum(aws.StringValue(x.GroupId)),
+		)
 	}
 
 	describeSubnetsInput := &ec2.DescribeSubnetsInput{
@@ -333,10 +336,14 @@ func (r *AWSInfrastructureProviderReconciler) schema(ctx context.Context, ip *v1
 			WithEnum(instanceProfiles...).SchemaProps,
 
 		spec.ArrayProperty(
-			spec.StringProperty().
-				WithEnum(securityGroups...),
+			&spec.Schema{
+				SchemaProps: spec.SchemaProps{
+					Type:  spec.StringOrArray{"string"},
+					AnyOf: securityGroups,
+				},
+			},
 		).
-			WithID("securityGroupNames").
+			WithID("securityGroupIDs").
 			WithTitle("SecurityGroups").SchemaProps,
 		// TODO(ktravis): more detail in the options, optional things - tags
 		// etc ...
